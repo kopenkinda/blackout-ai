@@ -35,7 +35,7 @@ npm ci
 npm run dev
 ```
 
-Open the URL Vite prints. The app lives under the `/slop-blackout/` path locally and in production. A browser with WebGL is required.
+Open the URL Vite prints. The app lives under the `/blackout-ai/` path locally and in production. A browser with WebGL is required.
 
 ```sh
 npm run check  # TypeScript type check
@@ -63,4 +63,4 @@ The simulation in `game.ts` has no dependency on Three.js or the DOM. The tests 
 
 ## Deployment
 
-Every push to `main` installs dependencies, type-checks, runs the tests, builds the site, and deploys `dist/` to GitHub Pages. The Vite base path is set to `/slop-blackout/`. Change it in `vite.config.ts` if the repository gets a different name.
+Every push to `main` installs dependencies, type-checks, runs the tests, builds the site, and deploys `dist/` to GitHub Pages. The Vite base path is set to `/blackout-ai/`. Change it in `vite.config.ts` if the repository gets a different name.

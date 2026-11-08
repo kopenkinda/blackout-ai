@@ -1,7 +1,7 @@
 import { defineConfig } from "vite";
 
 export default defineConfig({
-  base: "/slop-blackout/",
+  base: "/blackout-ai/",
   build: {
     rollupOptions: {
       output: {
