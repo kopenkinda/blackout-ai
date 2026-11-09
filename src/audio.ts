@@ -31,35 +31,44 @@ export function createAudio() {
   };
 
   /** A noise burst through a filter with a decaying envelope. */
-  const burst = (duration: number, gain: number, type: BiquadFilterType, frequency: number) => {
+  const burst = (duration: number, gain: number, type: BiquadFilterType, frequency: number, at = 0) => {
     const o = live();
     if (!o) return;
     const { ctx, master } = o;
+    const start = ctx.currentTime + at;
     const src = ctx.createBufferSource();
     src.buffer = noise(ctx, duration);
     const env = ctx.createGain();
-    env.gain.setValueAtTime(gain, ctx.currentTime);
-    env.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
+    env.gain.setValueAtTime(gain, start);
+    env.gain.exponentialRampToValueAtTime(0.001, start + duration);
     src.connect(filter(ctx, type, frequency)).connect(env).connect(master);
-    src.start();
-    src.stop(ctx.currentTime + duration);
+    src.start(start);
+    src.stop(start + duration);
   };
 
   /** A tone sliding between two pitches while it fades out. */
-  const slide = (type: OscillatorType, from: number, to: number, duration: number, gain: number) => {
+  const slide = (
+    type: OscillatorType,
+    from: number,
+    to: number,
+    duration: number,
+    gain: number,
+    at = 0,
+  ) => {
     const o = live();
     if (!o) return;
     const { ctx, master } = o;
+    const start = ctx.currentTime + at;
     const osc = ctx.createOscillator();
     osc.type = type;
-    osc.frequency.setValueAtTime(from, ctx.currentTime);
-    osc.frequency.exponentialRampToValueAtTime(to, ctx.currentTime + duration);
+    osc.frequency.setValueAtTime(from, start);
+    osc.frequency.exponentialRampToValueAtTime(to, start + duration);
     const env = ctx.createGain();
-    env.gain.setValueAtTime(gain, ctx.currentTime);
-    env.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
+    env.gain.setValueAtTime(gain, start);
+    env.gain.exponentialRampToValueAtTime(0.001, start + duration);
     osc.connect(env).connect(master);
-    osc.start();
-    osc.stop(ctx.currentTime + duration);
+    osc.start(start);
+    osc.stop(start + duration);
   };
 
   const startBed = (ctx: AudioContext, master: GainNode): Output => {
@@ -165,21 +174,26 @@ export function createAudio() {
       burst(1.4, 0.7, "lowpass", 1400);
       slide("sine", 70, 18, 1.8, 0.6);
     },
+    /** The hunters die down, the grid hums back up, lamps click on, then a chord. */
     won() {
       const o = live();
       if (!o) return;
-      const { ctx, master, hum } = o;
+      const { ctx, master, hum, menace } = o;
       hum.gain.setTargetAtTime(0, ctx.currentTime, 0.3);
+      menace.gain.setTargetAtTime(0, ctx.currentTime, 0.4);
+      slide("sawtooth", 24, 58, 5, 0.14, 1.2);
+      for (let i = 0; i < 16; i++) burst(0.03, 0.1, "highpass", 1800, 1.6 + Math.random() * 4.5);
       [220, 277.2, 329.6, 440].forEach((frequency, i) => {
         const osc = ctx.createOscillator();
         osc.frequency.value = frequency;
         const env = ctx.createGain();
-        env.gain.setValueAtTime(0.0001, ctx.currentTime);
-        env.gain.exponentialRampToValueAtTime(0.07, ctx.currentTime + 1.5 + i * 0.4);
-        env.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 6);
+        const start = ctx.currentTime + 3;
+        env.gain.setValueAtTime(0.0001, start);
+        env.gain.exponentialRampToValueAtTime(0.07, start + 2 + i * 0.4);
+        env.gain.exponentialRampToValueAtTime(0.0001, start + 8);
         osc.connect(env).connect(master);
-        osc.start();
-        osc.stop(ctx.currentTime + 6);
+        osc.start(start);
+        osc.stop(start + 8);
       });
     },
   };

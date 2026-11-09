@@ -1,5 +1,5 @@
-// Simulation: player movement and stamina, the node switches, and the
-// hunter that patrols the streets and chases what it sees or hears.
+// Simulation: player movement and stamina, the node switches, and the four
+// hunters that patrol the streets and chase what they see or hear.
 // No rendering or DOM. Events queue up for the interface to drain.
 
 import {
@@ -19,76 +19,175 @@ export const STAMINA = { max: 100, drain: 22, regen: 14, recover: 30 };
 export const HUNTER = {
   radius: 0.6,
   catchDistance: 1.6,
-  wanderSpeed: 2.4,
-  huntSpeed: 4.3,
-  // Each shutdown adds this much to the hunt speed.
-  huntGain: 0.5,
-  loseAfter: 3,
+  /** Added to every hunter's speeds per shutdown. */
+  huntGain: 0.25,
+  wanderGain: 0.1,
   searchWait: 2.5,
   seeLit: 36,
   seeDark: 14,
   hearSprint: 24,
   hearWalk: 9,
 };
+/** The grid sends the nearest idle hunter toward the player on this cadence. */
+export const SWEEP = { first: 20, every: 28, faster: 3, min: 12 };
 export const SHUTDOWN_HOLD = 3;
 const STRIDE = 2.1;
 const LOOK_SENSITIVITY = 0.0022;
 
+export type HunterProfile = {
+  name: string;
+  /** Which lab it is a nod to. Drives the look. */
+  maker: "claude" | "codex";
+  /** Shown when it catches you. */
+  line: string;
+  wander: number;
+  hunt: number;
+  /** Multipliers on the shared sight and hearing ranges. */
+  sight: number;
+  hearing: number;
+  /** Seconds without a line of sight before it gives up the chase. */
+  loseAfter: number;
+  /** Seconds ahead it guesses your position when it loses you. */
+  predict: number;
+};
+
+export const PROFILES: HunterProfile[] = [
+  {
+    name: "OPUS",
+    maker: "claude",
+    line: "It was never going to stop.",
+    wander: 2.2,
+    hunt: 4,
+    sight: 1,
+    hearing: 1,
+    loseAfter: 7,
+    predict: 0,
+  },
+  {
+    name: "FABLE",
+    maker: "claude",
+    line: "It guessed where you were going. It guessed right.",
+    wander: 3.2,
+    hunt: 5.2,
+    sight: 0.8,
+    hearing: 0.8,
+    loseAfter: 2,
+    predict: 3,
+  },
+  {
+    name: "SOL",
+    maker: "codex",
+    line: "You saw its light. It saw yours.",
+    wander: 2.4,
+    hunt: 4.4,
+    sight: 1.5,
+    hearing: 0.5,
+    loseAfter: 4,
+    predict: 0,
+  },
+  {
+    name: "ASTRA",
+    maker: "codex",
+    line: "It heard you long before it saw you.",
+    wander: 2.6,
+    hunt: 4.6,
+    sight: 0.6,
+    hearing: 1.9,
+    loseAfter: 3,
+    predict: 0,
+  },
+];
+
 export type Input = { forward: number; strafe: number; sprint: boolean; interact: boolean };
 export type Status = "ready" | "playing" | "paused" | "won" | "caught";
 export type HunterState = "wander" | "hunt" | "search";
+export type Hunter = Vec2 & {
+  profile: HunterProfile;
+  state: HunterState;
+  sees: boolean;
+  goal: Vec2 | null;
+  path: Vec2[];
+  lostFor: number;
+  waitFor: number;
+  /** Seconds spent not moving while trying to. Breaks pathing dead ends. */
+  stuckFor: number;
+};
 export type GameEvent =
   | { type: "step"; sprinting: boolean }
   | { type: "flashlight"; on: boolean }
   | { type: "shutdown"; node: number; remaining: number }
-  | { type: "spotted" }
-  | { type: "caught" }
+  | { type: "spotted"; hunter: number }
+  | { type: "caught"; hunter: number }
   | { type: "won"; time: number };
 
 export class Game {
   readonly city: City;
   status: Status = "ready";
   elapsed = 0;
-  player: Vec2 & { yaw: number; pitch: number; moving: boolean; sprinting: boolean };
+  player: Vec2 & {
+    yaw: number;
+    pitch: number;
+    vx: number;
+    vz: number;
+    moving: boolean;
+    sprinting: boolean;
+  };
   stamina = STAMINA.max;
   exhausted = false;
   flashlight = true;
-  hunter: Vec2 & {
-    state: HunterState;
-    sees: boolean;
-    goal: Vec2 | null;
-    path: Vec2[];
-    lostFor: number;
-    waitFor: number;
-  };
+  hunters: Hunter[];
+  caughtBy: number | null = null;
   nodes: { lit: boolean; progress: number }[];
   shutdowns = 0;
   /** Index of the lit node within reach, if any. */
   activeNode: number | null = null;
   events: GameEvent[] = [];
   private stride = 0;
+  private sweepIn = SWEEP.first;
+  /** What the player bumps into. */
   private readonly solids: Rect[];
+  /** What the hunters bump into. They see over cars but not through buildings. */
+  private readonly blockers: Rect[];
   private readonly rand: () => number;
 
   constructor(seed = 1) {
     this.city = createCity(seed);
     this.rand = mulberry32(seed ^ 0x9e3779b9);
-    this.solids = [...this.city.buildings, ...this.city.nodes.map(terminalRect)];
-    this.player = { ...this.city.spawn, yaw: 0, pitch: 0, moving: false, sprinting: false };
-    this.hunter = {
-      ...this.city.hunterSpawn,
+    this.blockers = [...this.city.buildings, ...this.city.cars];
+    this.solids = [...this.blockers, ...this.city.nodes.map(terminalRect)];
+    this.player = {
+      ...this.city.spawn,
+      yaw: 0,
+      pitch: 0,
+      vx: 0,
+      vz: 0,
+      moving: false,
+      sprinting: false,
+    };
+    this.hunters = PROFILES.map((profile, i) => ({
+      ...this.city.hunterSpawns[i % this.city.hunterSpawns.length],
+      profile,
       state: "wander",
       sees: false,
       goal: null,
       path: [],
       lostFor: 0,
       waitFor: 0,
-    };
+      stuckFor: 0,
+    }));
     this.nodes = this.city.nodes.map(() => ({ lit: true, progress: 0 }));
   }
 
   get remaining(): number {
     return this.nodes.filter((n) => n.lit).length;
+  }
+
+  /** 0 to 1. How close the nearest hunter is, never below 0.4 while one is hunting. */
+  get danger(): number {
+    const p = this.player;
+    const nearest = Math.min(...this.hunters.map((h) => Math.hypot(h.x - p.x, h.z - p.z)));
+    const closeness = clamp(1 - (nearest - 3) / 38, 0, 1);
+    return this.hunters.some((h) => h.state === "hunt") ? Math.max(closeness, 0.4) : closeness;
   }
 
   start() {
@@ -120,7 +219,15 @@ export class Game {
     this.elapsed += dt;
     this.movePlayer(dt, input);
     this.operateSwitch(dt, input.interact);
-    if (this.status === "playing") this.moveHunter(dt);
+    if (this.status !== "playing") return;
+    this.sweepIn -= dt;
+    if (this.sweepIn <= 0) {
+      this.sweep();
+      this.sweepIn = Math.max(SWEEP.min, SWEEP.every - SWEEP.faster * this.shutdowns);
+    }
+    this.hunters.forEach((h, i) => {
+      if (this.status === "playing") this.moveHunter(h, i, dt);
+    });
   }
 
   private movePlayer(dt: number, input: Input) {
@@ -135,9 +242,11 @@ export class Game {
     }
     p.sprinting = p.moving && input.sprint && !this.exhausted;
     const speed = p.sprinting ? PLAYER.sprint : PLAYER.walk;
+    p.vx = p.moving ? mx * speed : 0;
+    p.vz = p.moving ? mz * speed : 0;
     if (p.moving) {
-      p.x += mx * speed * dt;
-      p.z += mz * speed * dt;
+      p.x += p.vx * dt;
+      p.z += p.vz * dt;
       resolveCircle(p, PLAYER.radius, this.solids);
       const limit = this.city.half - PLAYER.radius;
       p.x = clamp(p.x, -limit, limit);
@@ -189,46 +298,67 @@ export class Game {
       this.events.push({ type: "won", time: this.elapsed });
       return;
     }
-    // The grid notices. The hunter heads for where the switch was thrown.
-    const h = this.hunter;
+    // The grid notices. Every hunter heads for where the switch was thrown.
+    for (const h of this.hunters) this.send(h, { x: this.player.x, z: this.player.z });
+  }
+
+  /** The grid knows roughly where you are and sends the nearest idle hunter. */
+  private sweep() {
+    const p = this.player;
+    const idle = this.hunters
+      .filter((h) => h.state === "wander")
+      .sort((a, b) => Math.hypot(a.x - p.x, a.z - p.z) - Math.hypot(b.x - p.x, b.z - p.z));
+    if (idle.length === 0) return;
+    const near = nearestIntersection(this.city, p);
+    const jitter = () => Math.round(this.rand() * 2 - 1);
+    const goal = intersection(
+      this.city,
+      clamp(near.i + jitter(), 0, this.city.blocks),
+      clamp(near.j + jitter(), 0, this.city.blocks),
+    );
+    this.send(idle[0], goal);
+  }
+
+  private send(h: Hunter, goal: Vec2) {
     h.state = "search";
-    h.goal = { x: this.player.x, z: this.player.z };
+    h.goal = goal;
     h.path = [];
     h.lostFor = 0;
     h.waitFor = 0;
+    h.stuckFor = 0;
   }
 
-  private moveHunter(dt: number) {
-    const h = this.hunter;
+  private moveHunter(h: Hunter, index: number, dt: number) {
     const p = this.player;
+    const f = h.profile;
     const distance = Math.hypot(p.x - h.x, p.z - h.z);
     const los = hasLineOfSight(h, p, this.city.buildings);
-    const seeRange = this.flashlight ? HUNTER.seeLit : HUNTER.seeDark;
-    const hearRange = p.sprinting ? HUNTER.hearSprint : p.moving ? HUNTER.hearWalk : 0;
+    const seeRange = (this.flashlight ? HUNTER.seeLit : HUNTER.seeDark) * f.sight;
+    const hearRange = (p.sprinting ? HUNTER.hearSprint : p.moving ? HUNTER.hearWalk : 0) * f.hearing;
     h.sees = (los && distance < seeRange) || distance < hearRange;
     if (h.sees) {
-      if (h.state !== "hunt") this.events.push({ type: "spotted" });
+      if (h.state !== "hunt") this.events.push({ type: "spotted", hunter: index });
       h.state = "hunt";
-      h.goal = { x: p.x, z: p.z };
+      h.goal = this.onStreet({ x: p.x + p.vx * f.predict, z: p.z + p.vz * f.predict }) ?? { x: p.x, z: p.z };
       h.path = [];
       h.lostFor = 0;
     }
-    const huntSpeed = HUNTER.huntSpeed + HUNTER.huntGain * this.shutdowns;
+    const huntSpeed = f.hunt + HUNTER.huntGain * this.shutdowns;
     switch (h.state) {
       case "hunt":
         if (h.sees && los) {
           this.advance(h, p, huntSpeed, dt);
         } else {
-          this.travel(huntSpeed, dt);
+          this.travel(h, huntSpeed, dt);
           h.lostFor += dt;
-          if (h.lostFor > HUNTER.loseAfter) {
+          if (h.lostFor > f.loseAfter) {
             h.state = "search";
             h.waitFor = 0;
           }
         }
         break;
       case "search":
-        if (this.travel(huntSpeed * 0.8, dt)) {
+        if (this.travel(h, huntSpeed * 0.8, dt)) {
           h.waitFor += dt;
           if (h.waitFor > HUNTER.searchWait) {
             h.state = "wander";
@@ -237,28 +367,44 @@ export class Game {
         }
         break;
       case "wander":
-        if (!h.goal || this.travel(HUNTER.wanderSpeed + 0.15 * this.shutdowns, dt)) {
-          h.goal = this.wanderGoal();
+        if (!h.goal || this.travel(h, f.wander + HUNTER.wanderGain * this.shutdowns, dt)) {
+          h.goal = this.wanderGoal(h);
           h.path = [];
         }
         break;
     }
     if (Math.hypot(p.x - h.x, p.z - h.z) < HUNTER.catchDistance) {
       this.status = "caught";
-      this.events.push({ type: "caught" });
+      this.caughtBy = index;
+      this.events.push({ type: "caught", hunter: index });
     }
   }
 
-  /** Moves the hunter along the streets toward its goal. True on arrival. */
-  private travel(speed: number, dt: number): boolean {
-    const h = this.hunter;
+  /** The point itself if a hunter could stand there, otherwise null. */
+  private onStreet(point: Vec2): Vec2 | null {
+    const limit = this.city.half - HUNTER.radius;
+    if (Math.abs(point.x) > limit || Math.abs(point.z) > limit) return null;
+    const blocked = this.blockers.some(
+      (r) =>
+        Math.abs(point.x - r.x) < r.w / 2 + HUNTER.radius &&
+        Math.abs(point.z - r.z) < r.d / 2 + HUNTER.radius,
+    );
+    return blocked ? null : point;
+  }
+
+  /** Moves a hunter along the streets toward its goal. True on arrival. */
+  private travel(h: Hunter, speed: number, dt: number): boolean {
     const goal = h.goal;
     if (!goal || Math.hypot(goal.x - h.x, goal.z - h.z) < 1) return true;
+    if (h.stuckFor > 2) return true;
     const walls = this.city.buildings;
     if (h.path.length === 0 && !hasLineOfSight(h, goal, walls)) h.path = this.route(h, goal);
     // Drop waypoints we can already see past.
     while (h.path.length && hasLineOfSight(h, h.path[1] ?? goal, walls)) h.path.shift();
+    const before = { x: h.x, z: h.z };
     this.advance(h, h.path[0] ?? goal, speed, dt);
+    const moved = Math.hypot(h.x - before.x, h.z - before.z);
+    h.stuckFor = moved < speed * dt * 0.2 ? h.stuckFor + dt : 0;
     return false;
   }
 
@@ -285,11 +431,11 @@ export class Game {
     return points;
   }
 
-  /** Half the time the hunter drifts toward the player's part of town. */
-  private wanderGoal(): Vec2 {
+  /** Half the time a hunter drifts toward the player's part of town. */
+  private wanderGoal(h: Hunter): Vec2 {
     const city = this.city;
     const towardPlayer = this.rand() < 0.5;
-    const near = nearestIntersection(city, towardPlayer ? this.player : this.hunter);
+    const near = nearestIntersection(city, towardPlayer ? this.player : h);
     const spread = towardPlayer ? 2 : 3;
     const jitter = () => Math.round((this.rand() * 2 - 1) * spread);
     return intersection(
@@ -307,7 +453,7 @@ export class Game {
     const s = Math.min(d, speed * dt);
     e.x += (dx / d) * s;
     e.z += (dz / d) * s;
-    resolveCircle(e, HUNTER.radius, this.city.buildings);
+    resolveCircle(e, HUNTER.radius, this.blockers);
   }
 }
 

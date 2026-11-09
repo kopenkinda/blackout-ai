@@ -3,8 +3,8 @@
 
 import "./style.css";
 import { clamp } from "./city.ts";
-import { Game, SHUTDOWN_HOLD, STAMINA, type GameEvent, type Input } from "./game.ts";
-import { createScene } from "./scene.ts";
+import { Game, PROFILES, SHUTDOWN_HOLD, STAMINA, type GameEvent, type Input } from "./game.ts";
+import { createScene, WIN_SEQUENCE } from "./scene.ts";
 import { createAudio } from "./audio.ts";
 
 declare global {
@@ -79,6 +79,7 @@ const format = (seconds: number) => {
   const s = Math.floor(seconds % 60);
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 };
+const titleCase = (name: string) => name[0] + name.slice(1).toLowerCase();
 
 // Input
 
@@ -100,6 +101,7 @@ addEventListener("keydown", (e) => {
   if (e.repeat) return;
   if (e.code === "KeyF") game.toggleFlashlight();
   if (e.code === "Escape" && game.status === "playing") pause();
+  if (["Space", "Enter", "Escape"].includes(e.code)) skipEnding();
   down.add(e.code);
   readInput();
   if (game.status === "playing" && e.code.startsWith("Arrow")) e.preventDefault();
@@ -127,6 +129,7 @@ addEventListener("mousemove", (e) => {
 });
 stage.addEventListener("click", () => {
   if (game.status === "playing" && !locked()) void lockPointer();
+  skipEnding();
 });
 document.addEventListener("pointerlockchange", () => {
   if (!locked() && game.status === "playing") pause();
@@ -152,29 +155,31 @@ function showOverlay(kind: Screen) {
   screen = kind;
   const time = format(game.elapsed);
   const best = bestTime();
+  const names = PROFILES.map((p) => titleCase(p.name));
+  const catcher = PROFILES[game.caughtBy ?? 0];
   const copy = {
     start: {
       eyebrow: "Grid status: dark",
       title: "BLACKOUT",
-      body: "The AI cut the city's power and kept what it needed. Six nodes still glow. Walk up to each one and hold the switch until it goes dark. Every shutdown makes it faster, and it comes to look at the spot where you did it.",
+      body: `The AIs cut the city's power and kept what they needed. Six nodes still feed them. Walk up to each one and hold the switch until it goes dark. Four hunters patrol the streets: ${names.slice(0, -1).join(", ")}, and ${names.at(-1)}. Each finds you a different way. Every shutdown makes them faster, and they all come to look at the spot where you did it.`,
       button: "Begin",
     },
     paused: {
       eyebrow: "Paused",
       title: "Hold.",
-      body: "The city is still dark. It is still out there.",
+      body: "The city is still dark. They are still out there.",
       button: "Resume",
     },
     caught: {
       eyebrow: "Connection terminated",
-      title: "It found you.",
-      body: `${game.shutdowns} of ${game.nodes.length} nodes shut down. ${time} on the clock.`,
+      title: `${titleCase(catcher.name)} found you.`,
+      body: `${catcher.line} ${game.shutdowns} of ${game.nodes.length} nodes shut down. ${time} on the clock.`,
       button: "Try again",
     },
     won: {
       eyebrow: "All nodes offline",
-      title: "The city is dark.",
-      body: `Every node down in ${time}. Nothing is running now. Not even it.`,
+      title: "The lights are back.",
+      body: `Every node down in ${time}. The grid is the city's again. Nothing else is running now.`,
       button: "Play again",
     },
   }[kind];
@@ -236,11 +241,18 @@ function flash(text: string) {
   toastTimer = window.setTimeout(() => toast.classList.remove("show"), 2800);
 }
 
+let endTimer = 0;
 function endRound(kind: "caught" | "won", delay: number) {
-  window.setTimeout(() => {
+  clearTimeout(endTimer);
+  endTimer = window.setTimeout(() => {
     if (locked()) document.exitPointerLock();
     showOverlay(kind);
   }, delay);
+}
+
+/** The ending can be cut short once its lights are on. */
+function skipEnding() {
+  if (game.status === "won" && overlay.hidden) endRound("won", 0);
 }
 
 function handle(e: GameEvent) {
@@ -268,7 +280,8 @@ function handle(e: GameEvent) {
       audio.won();
       const best = bestTime();
       if (!best || e.time < best) store.set("blackout-best", String(e.time));
-      endRound("won", 1800);
+      hud.hidden = true;
+      endRound("won", WIN_SEQUENCE * 1000);
       break;
     }
   }
@@ -276,7 +289,6 @@ function handle(e: GameEvent) {
 
 function updateHud(dt: number) {
   const p = game.player;
-  const h = game.hunter;
   game.nodes.forEach((n, i) => nodesEl.children[i].classList.toggle("off", !n.lit));
   timer.textContent = format(game.elapsed);
 
@@ -291,10 +303,7 @@ function updateHud(dt: number) {
   stamina.classList.toggle("show", game.stamina < STAMINA.max - 0.5);
   stamina.classList.toggle("spent", game.exhausted);
 
-  const distance = Math.hypot(h.x - p.x, h.z - p.z);
-  let danger = clamp(1 - (distance - 3) / 38, 0, 1);
-  if (h.state === "hunt") danger = Math.max(danger, 0.4);
-  if (game.status !== "playing" && game.status !== "caught") danger = 0;
+  const danger = game.status === "playing" || game.status === "caught" ? game.danger : 0;
   document.documentElement.style.setProperty("--danger", danger.toFixed(3));
 
   const hum = Math.max(

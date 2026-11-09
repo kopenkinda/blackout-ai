@@ -1,492 +1,353 @@
-// Rendering: the dark city, the glowing node buildings, the hunter, and the
-// player's flashlight. Reads game state every frame and never changes it.
+// Rendering: the camera, sky, moon, flashlight, dust, post-processing, and
+// the ending where the power comes back. The city comes from world.ts and
+// the hunters from hunters.ts. Reads game state every frame, never changes it.
 
 import * as THREE from "three";
-import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
-import {
-  intersection,
-  mulberry32,
-  TERMINAL,
-  type Building,
-  type City,
-  type NodeSite,
-} from "./city.ts";
-import { PLAYER, SHUTDOWN_HOLD, type Game } from "./game.ts";
+import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
+import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
+import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
+import { mulberry32, type City } from "./city.ts";
+import { PLAYER, PROFILES, type Game } from "./game.ts";
+import { createHunter, shortestTurn } from "./hunters.ts";
+import { canvasTexture, createWorld, glowTexture } from "./world.ts";
 
 export type SceneView = { render(game: Game, dt: number): void };
 
-const SKY = 0x05060b;
-const NODE_COLOR = 0x7df9ff;
-const EYE = { r: 1, g: 0.16, b: 0.16 };
-/** World units covered by one facade texture tile: four windows by four floors. */
-const TILE = { w: 8, h: 10 };
+/** Seconds the ending runs before the interface takes over. */
+export const WIN_SEQUENCE = 9.5;
+
+/** How the night looks, and how it looks once the power is back. */
+const NIGHT = {
+  top: new THREE.Color(0x020309),
+  horizon: new THREE.Color(0x0b0f1e),
+  hemi: new THREE.Color(0x1d2542),
+  fog: 0.014,
+};
+const POWERED = {
+  top: new THREE.Color(0x070a17),
+  horizon: new THREE.Color(0x3b2519),
+  hemi: new THREE.Color(0x4d4250),
+  fog: 0.005,
+};
+/** Low in the north, so it hangs at the end of the north-south streets. */
+const MOON = new THREE.Vector3(0.14, 0.34, -0.93).normalize();
+const FLASHLIGHT = 220;
+
+const clamp01 = (v: number) => Math.min(1, Math.max(0, v));
+const ease = (t: number) => t * t * (3 - 2 * t);
+
+/** Film grain, plus interference that tears the image as a hunter gets close. */
+const FILM = {
+  uniforms: {
+    tDiffuse: { value: null },
+    uTime: { value: 0 },
+    uDanger: { value: 0 },
+    uGlitch: { value: 1 },
+  },
+  vertexShader: `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }`,
+  fragmentShader: `
+    uniform sampler2D tDiffuse;
+    uniform float uTime;
+    uniform float uDanger;
+    uniform float uGlitch;
+    varying vec2 vUv;
+    float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+    void main() {
+      vec2 uv = vUv;
+      float row = floor(uv.y * 140.0);
+      float tear = step(1.0 - 0.08 * uDanger * uDanger * uGlitch, hash(vec2(row, floor(uTime * 24.0))));
+      uv.x += tear * (hash(vec2(uTime, row)) - 0.5) * 0.05;
+      vec2 split = (uv - 0.5) * (0.0015 + 0.009 * uDanger);
+      vec3 c = vec3(texture2D(tDiffuse, uv + split).r, texture2D(tDiffuse, uv).g, texture2D(tDiffuse, uv - split).b);
+      c += (hash(gl_FragCoord.xy + fract(uTime) * 61.0) - 0.5) * (0.05 + 0.04 * uDanger);
+      gl_FragColor = vec4(c, 1.0);
+    }`,
+};
 
 export function createScene(mount: HTMLElement, city: City): SceneView {
-  const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+  const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
   renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.15;
+  renderer.toneMappingExposure = 1.2;
   mount.appendChild(renderer.domElement);
 
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color(SKY);
-  scene.fog = new THREE.FogExp2(SKY, 0.014);
+  const fog = new THREE.FogExp2(NIGHT.horizon.getHex(), NIGHT.fog);
+  scene.fog = fog;
 
   const camera = new THREE.PerspectiveCamera(72, 1, 0.1, 900);
   camera.rotation.order = "YXZ";
   scene.add(camera);
 
-  scene.add(new THREE.HemisphereLight(0x1b2342, 0x000000, 0.85));
+  const hemi = new THREE.HemisphereLight(NIGHT.hemi, 0x050505, 0.6);
+  const moonlight = new THREE.DirectionalLight(0x8ea6dc, 0.7);
+  moonlight.position.copy(MOON).multiplyScalar(100);
+  scene.add(hemi, moonlight);
 
-  const flashlight = new THREE.SpotLight(0xfff1d6, 260, 60, 0.42, 0.5, 1.6);
+  const flashlight = new THREE.SpotLight(0xfff1d6, FLASHLIGHT, 60, 0.42, 0.5, 1.6);
   flashlight.position.set(0.25, -0.2, 0);
   flashlight.target.position.set(0, -0.6, -10);
   camera.add(flashlight, flashlight.target);
 
-  const textures = makeTextures();
-  scene.add(ground(city, textures), stars(), skyline(city, textures.facade), lampPosts(city));
-  const nodes = city.nodes.map((site) => makeNode(city, site, textures, scene));
-  const hunter = makeHunter(scene, textures);
+  const heavens = sky();
+  const night = stars();
+  const moon = moonSprites();
+  const motes = dust();
+  scene.add(heavens.mesh, night, moon.disc, moon.halo, motes.points);
+  const world = createWorld(scene, city);
+  const hunters = PROFILES.map((profile, i) => createHunter(scene, profile, i));
+
+  const composer = new EffectComposer(renderer);
+  composer.addPass(new RenderPass(scene, camera));
+  const bloom = new UnrealBloomPass(new THREE.Vector2(256, 256), 0.7, 0.45, 1);
+  composer.addPass(bloom);
+  composer.addPass(new OutputPass());
+  const film = new ShaderPass(FILM);
+  composer.addPass(film);
 
   const resize = () => {
     const { clientWidth: w, clientHeight: h } = mount;
     renderer.setSize(w, h, false);
+    composer.setSize(w, h);
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
+    motes.uniforms.uScale.value = renderer.domElement.height / (2 * Math.tan((camera.fov * Math.PI) / 360));
   };
   new ResizeObserver(resize).observe(mount);
   resize();
 
   const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  film.uniforms.uGlitch.value = reducedMotion ? 0 : 1;
   let time = 0;
   let bob = 0;
   let yaw = 0;
   let pitch = 0;
+  /** Seconds into the ending, or -1 while playing. */
+  let winT = -1;
+  const winOrigin = { x: 0, z: 0 };
+
+  /** The power comes back in a wave from where you stand. The sky warms with it. */
+  const powerUp = (t: number) => {
+    world.setPower(winOrigin, (t - 1.6) * 46);
+    const lights = ease(clamp01((t - 2) / 5));
+    heavens.uniforms.uTop.value.lerpColors(NIGHT.top, POWERED.top, lights);
+    heavens.uniforms.uHorizon.value.lerpColors(NIGHT.horizon, POWERED.horizon, lights);
+    fog.color.copy(heavens.uniforms.uHorizon.value);
+    fog.density = NIGHT.fog + (POWERED.fog - NIGHT.fog) * lights;
+    hemi.intensity = 0.6 + 1.1 * lights;
+    hemi.color.lerpColors(NIGHT.hemi, POWERED.hemi, lights);
+    night.material.opacity = 0.6 - 0.4 * lights;
+    bloom.strength = 0.7 + 0.35 * lights;
+  };
 
   return {
     render(game, dt) {
       time += dt;
       const p = game.player;
-      const h = game.hunter;
+      if (game.status === "won") {
+        if (winT < 0) {
+          winT = 0;
+          winOrigin.x = p.x;
+          winOrigin.z = p.z;
+        } else {
+          winT += dt;
+        }
+        powerUp(winT);
+      } else if (winT >= 0) {
+        winT = -1;
+        powerUp(0);
+      }
+
       if (p.moving && game.status === "playing" && !reducedMotion) {
         bob += dt * (p.sprinting ? 11 : 7.5);
       }
-      if (game.status === "caught") {
+      let height = PLAYER.eye;
+      if (game.status === "caught" && game.caughtBy !== null) {
         // Turn to face the thing that found you.
-        const toward = Math.atan2(-(h.x - p.x), -(h.z - p.z));
-        yaw += shortestTurn(yaw, toward) * Math.min(1, dt * 6);
+        const h = game.hunters[game.caughtBy];
+        yaw += shortestTurn(yaw, Math.atan2(-(h.x - p.x), -(h.z - p.z))) * Math.min(1, dt * 6);
         pitch += (0.3 - pitch) * Math.min(1, dt * 6);
+      } else if (winT >= 0) {
+        // Rise above the streets and watch the city come back.
+        const rise = ease(clamp01((winT - 1) / 7));
+        yaw = p.yaw + winT * 0.1;
+        pitch = p.pitch * (1 - rise) - 0.42 * rise;
+        height += rise * 55;
       } else {
         yaw = p.yaw;
         pitch = p.pitch;
       }
-      camera.position.set(p.x, PLAYER.eye + Math.sin(bob) * 0.035, p.z);
+      camera.position.set(p.x, height + Math.sin(bob) * 0.035, p.z);
       camera.rotation.set(pitch, yaw, 0);
-      flashlight.visible = game.flashlight;
-      flashlight.intensity = 260 * (0.95 + 0.05 * Math.sin(time * 37) * Math.sin(time * 11));
 
-      game.nodes.forEach((n, i) => nodes[i].update(n, dt, time));
-      hunter.update(game, dt, time);
-      renderer.render(scene, camera);
+      const beam = 1 - clamp01((winT - 2) / 2);
+      flashlight.visible = game.flashlight;
+      flashlight.intensity = FLASHLIGHT * beam * (0.95 + 0.05 * Math.sin(time * 37) * Math.sin(time * 11));
+      heavens.mesh.position.copy(camera.position);
+      night.position.copy(camera.position);
+      moon.disc.position.copy(camera.position).addScaledVector(MOON, 600);
+      moon.halo.position.copy(moon.disc.position);
+      motes.uniforms.uCam.value.copy(camera.position);
+      motes.uniforms.uTime.value = time;
+      motes.uniforms.uLight.value = game.flashlight ? beam : 0;
+
+      const danger = game.status === "playing" ? game.danger : game.status === "caught" ? 1 : 0;
+      film.uniforms.uDanger.value += (danger - film.uniforms.uDanger.value) * Math.min(1, dt * 4);
+      if (!reducedMotion) film.uniforms.uTime.value = time;
+
+      world.update(game, dt, time);
+      game.hunters.forEach((h, i) => hunters[i].update(h, game, dt, time, winT));
+      composer.render(dt);
     },
   };
 }
 
-function shortestTurn(from: number, to: number): number {
-  return ((to - from + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
-}
-
-type Textures = ReturnType<typeof makeTextures>;
-
-function makeTextures() {
-  const rand = mulberry32(7);
-  const canvas = (w: number, h: number, draw: (g: CanvasRenderingContext2D) => void) => {
-    const c = document.createElement("canvas");
-    c.width = w;
-    c.height = h;
-    draw(c.getContext("2d")!);
-    const t = new THREE.CanvasTexture(c);
-    t.wrapS = t.wrapT = THREE.RepeatWrapping;
-    t.colorSpace = THREE.SRGBColorSpace;
-    t.anisotropy = 4;
-    return t;
+/** A gradient dome that follows the camera, with haze around the moon. */
+function sky() {
+  const uniforms = {
+    uTop: { value: NIGHT.top.clone() },
+    uHorizon: { value: NIGHT.horizon.clone() },
+    uMoon: { value: MOON },
   };
-  const cell = 64;
-  const eachWindow = (f: (x: number, y: number) => void) => {
-    for (let x = 0; x < 4; x++) for (let y = 0; y < 4; y++) f(x * cell, y * cell);
-  };
-  const facade = canvas(256, 256, (g) => {
-    g.fillStyle = "#202229";
-    g.fillRect(0, 0, 256, 256);
-    for (let i = 0; i < 2000; i++) {
-      g.fillStyle = `rgba(0,0,0,${(rand() * 0.3).toFixed(2)})`;
-      g.fillRect(rand() * 256, rand() * 256, 2, 2);
-    }
-    eachWindow((x, y) => {
-      g.fillStyle = "#2c2f38";
-      g.fillRect(x + 12, y + 10, 40, 42);
-      g.fillStyle = `rgb(${9 + rand() * 5}, ${11 + rand() * 5}, ${18 + rand() * 8})`;
-      g.fillRect(x + 15, y + 13, 34, 36);
-    });
-  });
-  const windows = canvas(256, 256, (g) => {
-    g.fillStyle = "#000";
-    g.fillRect(0, 0, 256, 256);
-    eachWindow((x, y) => {
-      if (rand() < 0.18) return;
-      g.fillStyle = `rgba(255,255,255,${(0.45 + rand() * 0.55).toFixed(2)})`;
-      g.fillRect(x + 15, y + 13, 34, 36);
-    });
-  });
-  const asphalt = canvas(256, 256, (g) => {
-    g.fillStyle = "#26262a";
-    g.fillRect(0, 0, 256, 256);
-    for (let i = 0; i < 6000; i++) {
-      const v = Math.floor(25 + rand() * 30);
-      g.fillStyle = `rgb(${v},${v},${v + 3})`;
-      g.fillRect(rand() * 256, rand() * 256, 1.5, 1.5);
-    }
-  });
-  const dash = canvas(8, 64, (g) => {
-    g.fillStyle = "#fff";
-    g.fillRect(0, 0, 8, 26);
-  });
-  const screen = (id: number) =>
-    canvas(256, 160, (g) => {
-      g.fillStyle = "#03110f";
-      g.fillRect(0, 0, 256, 160);
-      g.fillStyle = "#7df9ff";
-      g.font = "bold 28px ui-monospace, Menlo, monospace";
-      g.fillText(`NODE ${String(id + 1).padStart(2, "0")}`, 18, 44);
-      g.font = "18px ui-monospace, Menlo, monospace";
-      g.fillStyle = "#5ad7dd";
-      const lines = ["LINK   ACTIVE", `LOAD   ${91 + ((id * 7) % 8)}%`, "POWER  LOCAL"];
-      lines.forEach((line, i) => g.fillText(line, 18, 80 + i * 26));
-      g.fillStyle = "#7df9ff";
-      g.fillRect(200, 134, 14, 4);
-      g.fillStyle = "rgba(0,0,0,0.25)";
-      for (let y = 0; y < 160; y += 3) g.fillRect(0, y, 256, 1);
-    });
-  const glow = canvas(64, 64, (g) => {
-    const r = g.createRadialGradient(32, 32, 0, 32, 32, 32);
-    r.addColorStop(0, "rgba(255,255,255,1)");
-    r.addColorStop(0.35, "rgba(255,255,255,0.35)");
-    r.addColorStop(1, "rgba(255,255,255,0)");
-    g.fillStyle = r;
-    g.fillRect(0, 0, 64, 64);
-  });
-  // Alpha for the node beams: solid at the roof, gone at the top.
-  const fade = canvas(4, 64, (g) => {
-    const r = g.createLinearGradient(0, 0, 0, 64);
-    r.addColorStop(0, "#000");
-    r.addColorStop(1, "#fff");
-    g.fillStyle = r;
-    g.fillRect(0, 0, 4, 64);
-  });
-  return { facade, windows, asphalt, dash, screen, glow, fade };
-
-
-}
-
-/** A box with its texture scaled so windows stay the same size on every building. */
-function buildingGeometry(b: Building): THREE.BufferGeometry {
-  const g = new THREE.BoxGeometry(b.w, b.h, b.d);
-  const uv = g.attributes.uv as THREE.BufferAttribute;
-  // Face order: +x, -x, +y, -y, +z, -z. Four vertices each.
-  const spans = [
-    [b.d, b.h],
-    [b.d, b.h],
-    [b.w, b.d],
-    [b.w, b.d],
-    [b.w, b.h],
-    [b.w, b.h],
-  ];
-  for (let i = 0; i < 24; i++) {
-    const [su, sv] = spans[Math.floor(i / 4)];
-    uv.setXY(i, (uv.getX(i) * su) / TILE.w, (uv.getY(i) * sv) / TILE.h);
-  }
-  g.translate(b.x, b.h / 2, b.z);
-  return g;
-}
-
-function blockCenter(city: City, i: number, j: number) {
-  const c = intersection(city, i, j);
-  const o = city.streetWidth / 2 + city.blockSize / 2;
-  return { x: c.x + o, z: c.z + o };
-}
-
-function ground(city: City, tex: Textures): THREE.Group {
-  const group = new THREE.Group();
-  const size = city.half * 2 + 400;
-  tex.asphalt.repeat.set(size / 9, size / 9);
-  const asphalt = new THREE.Mesh(
-    new THREE.PlaneGeometry(size, size),
-    new THREE.MeshStandardMaterial({ map: tex.asphalt, roughness: 0.95 }),
+  const mesh = new THREE.Mesh(
+    new THREE.SphereGeometry(700, 32, 16),
+    new THREE.ShaderMaterial({
+      uniforms,
+      side: THREE.BackSide,
+      depthWrite: false,
+      fog: false,
+      vertexShader: `
+        varying vec3 vDir;
+        void main() {
+          vDir = position;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }`,
+      fragmentShader: `
+        uniform vec3 uTop;
+        uniform vec3 uHorizon;
+        uniform vec3 uMoon;
+        varying vec3 vDir;
+        void main() {
+          vec3 d = normalize(vDir);
+          vec3 c = mix(uHorizon, uTop, pow(clamp(d.y, 0.0, 1.0), 0.5));
+          c += vec3(0.02, 0.026, 0.04) * pow(max(dot(d, uMoon), 0.0), 16.0);
+          gl_FragColor = vec4(c, 1.0);
+        }`,
+    }),
   );
-  asphalt.rotation.x = -Math.PI / 2;
-  group.add(asphalt);
-
-  // Raised sidewalks under every block.
-  const slabs: THREE.BufferGeometry[] = [];
-  for (let i = 0; i < city.blocks; i++) {
-    for (let j = 0; j < city.blocks; j++) {
-      const c = blockCenter(city, i, j);
-      const slab = new THREE.BoxGeometry(city.blockSize, 0.12, city.blockSize);
-      slab.translate(c.x, 0.06, c.z);
-      slabs.push(slab);
-    }
-  }
-  group.add(
-    new THREE.Mesh(
-      mergeGeometries(slabs)!,
-      new THREE.MeshStandardMaterial({ color: 0x3a3b41, roughness: 0.95 }),
-    ),
-  );
-
-  // Faded lane lines down the middle of every street.
-  const length = city.half * 2;
-  tex.dash.repeat.set(1, length / 8);
-  const dashMaterial = new THREE.MeshStandardMaterial({
-    map: tex.dash,
-    transparent: true,
-    color: 0xd9cf9c,
-    roughness: 0.9,
-    depthWrite: false,
-    polygonOffset: true,
-    polygonOffsetFactor: -2,
-    polygonOffsetUnits: -2,
-  });
-  const dashGeometry = new THREE.PlaneGeometry(0.22, length);
-  for (let k = 0; k <= city.blocks; k++) {
-    const c = intersection(city, k, k);
-    const along = new THREE.Mesh(dashGeometry, dashMaterial);
-    along.rotation.set(-Math.PI / 2, 0, 0);
-    along.position.set(c.x, 0.02, 0);
-    const across = new THREE.Mesh(dashGeometry, dashMaterial);
-    across.rotation.set(-Math.PI / 2, 0, Math.PI / 2);
-    across.position.set(0, 0.02, c.z);
-    group.add(along, across);
-  }
-  return group;
+  mesh.renderOrder = -1;
+  return { mesh, uniforms };
 }
 
-function stars(): THREE.Points {
+function stars(): THREE.Points<THREE.BufferGeometry, THREE.PointsMaterial> {
   const rand = mulberry32(99);
-  const count = 700;
+  const count = 900;
   const positions = new Float32Array(count * 3);
   for (let i = 0; i < count; i++) {
     const theta = rand() * Math.PI * 2;
-    const phi = Math.acos(0.1 + rand() * 0.9);
-    positions.set(
-      [800 * Math.sin(phi) * Math.cos(theta), 800 * Math.cos(phi), 800 * Math.sin(phi) * Math.sin(theta)],
-      i * 3,
-    );
+    const phi = Math.acos(0.12 + rand() * 0.88);
+    const r = 600;
+    positions.set([r * Math.sin(phi) * Math.cos(theta), r * Math.cos(phi), r * Math.sin(phi) * Math.sin(theta)], i * 3);
   }
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
   return new THREE.Points(
     geometry,
     new THREE.PointsMaterial({
-      color: 0x9fb0ff,
-      size: 1.8,
+      color: 0xaab8ff,
+      size: 1.6,
       sizeAttenuation: false,
       transparent: true,
-      opacity: 0.55,
+      opacity: 0.6,
+      depthWrite: false,
       fog: false,
     }),
   );
 }
 
-/** Every unpowered building, merged into one mesh. */
-function skyline(city: City, facade: THREE.Texture): THREE.Mesh {
-  const parts = city.buildings.filter((b) => b.node === null).map(buildingGeometry);
-  const merged = mergeGeometries(parts)!;
-  parts.forEach((g) => g.dispose());
-  return new THREE.Mesh(
-    merged,
-    new THREE.MeshStandardMaterial({ map: facade, roughness: 0.9, metalness: 0.05 }),
-  );
-}
-
-/** Dead street lamps at every block corner. */
-function lampPosts(city: City): THREE.Mesh {
-  const pole = new THREE.CylinderGeometry(0.08, 0.12, 7, 6);
-  pole.translate(0, 3.5, 0);
-  const head = new THREE.BoxGeometry(0.9, 0.22, 0.32);
-  head.translate(0.4, 7, 0);
-  const lamp = mergeGeometries([pole, head])!;
-  const parts: THREE.BufferGeometry[] = [];
-  const off = city.blockSize / 2 - 0.8;
-  for (let i = 0; i < city.blocks; i++) {
-    for (let j = 0; j < city.blocks; j++) {
-      const c = blockCenter(city, i, j);
-      for (const kx of [-1, 1]) {
-        for (const kz of [-1, 1]) {
-          const g = lamp.clone();
-          g.rotateY(Math.atan2(-kz, kx));
-          g.translate(c.x + kx * off, 0, c.z + kz * off);
-          parts.push(g);
-        }
-      }
+function moonSprites() {
+  const face = canvasTexture(128, 128, (g) => {
+    const edge = g.createRadialGradient(64, 64, 52, 64, 64, 60);
+    edge.addColorStop(0, "rgba(236,240,250,1)");
+    edge.addColorStop(1, "rgba(236,240,250,0)");
+    g.fillStyle = edge;
+    g.fillRect(0, 0, 128, 128);
+    const rand = mulberry32(5);
+    for (let i = 0; i < 9; i++) {
+      g.fillStyle = `rgba(120,130,155,${(0.15 + rand() * 0.2).toFixed(2)})`;
+      g.beginPath();
+      g.arc(34 + rand() * 60, 34 + rand() * 60, 4 + rand() * 12, 0, Math.PI * 2);
+      g.fill();
     }
-  }
-  return new THREE.Mesh(
-    mergeGeometries(parts)!,
-    new THREE.MeshStandardMaterial({ color: 0x15161b, metalness: 0.6, roughness: 0.5 }),
+  });
+  const disc = new THREE.Sprite(
+    new THREE.SpriteMaterial({ map: face, color: new THREE.Color(0.95, 1, 1.1), fog: false, depthWrite: false }),
   );
+  disc.scale.setScalar(26);
+  const halo = new THREE.Sprite(
+    new THREE.SpriteMaterial({
+      map: glowTexture(),
+      color: new THREE.Color(0.07, 0.09, 0.15),
+      blending: THREE.AdditiveBlending,
+      fog: false,
+      depthWrite: false,
+    }),
+  );
+  halo.scale.setScalar(110);
+  return { disc, halo };
 }
 
-function makeNode(city: City, site: NodeSite, tex: Textures, scene: THREE.Scene) {
-  const b = city.buildings[site.building];
-  const material = new THREE.MeshStandardMaterial({
-    map: tex.facade,
-    emissiveMap: tex.windows,
-    emissive: new THREE.Color(NODE_COLOR),
-    emissiveIntensity: 1.3,
-    roughness: 0.85,
-    // Visible from across the city, like lit windows on a clear night.
-    fog: false,
-  });
-  const building = new THREE.Mesh(buildingGeometry(b), material);
-
-  const beamMaterial = new THREE.MeshBasicMaterial({
-    color: NODE_COLOR,
-    transparent: true,
-    opacity: 0.12,
-    alphaMap: tex.fade,
-    blending: THREE.AdditiveBlending,
-    depthWrite: false,
-    side: THREE.DoubleSide,
-    fog: false,
-  });
-  const beam = new THREE.Mesh(new THREE.CylinderGeometry(1.2, 4, 300, 16, 1, true), beamMaterial);
-  beam.position.set(b.x, b.h + 150, b.z);
-
-  const beacon = new THREE.Mesh(
-    new THREE.SphereGeometry(0.25, 8, 8),
-    new THREE.MeshBasicMaterial({ color: 0xff3030, fog: false }),
-  );
-  beacon.position.set(b.x - b.w / 2 + 1, b.h + 0.3, b.z - b.d / 2 + 1);
-
-  const glow = new THREE.PointLight(NODE_COLOR, 90, 55, 2);
-  glow.position.set(site.x + site.facing.x * 4, 6, site.z + site.facing.z * 4);
-
-  const terminal = new THREE.Group();
-  terminal.position.set(site.x, 0, site.z);
-  terminal.rotation.y = Math.atan2(site.facing.x, site.facing.z);
-  const rack = new THREE.Mesh(
-    new THREE.BoxGeometry(TERMINAL.w, TERMINAL.h, TERMINAL.d),
-    new THREE.MeshStandardMaterial({ color: 0x1a1d23, metalness: 0.7, roughness: 0.35 }),
-  );
-  rack.position.y = TERMINAL.h / 2;
-  const screenMaterial = new THREE.MeshBasicMaterial({ map: tex.screen(site.id) });
-  const screen = new THREE.Mesh(new THREE.PlaneGeometry(0.9, 0.56), screenMaterial);
-  screen.position.set(0, 1.42, TERMINAL.d / 2 + 0.006);
-  const ledMaterial = new THREE.MeshBasicMaterial({ color: 0x4dff88 });
-  const ledGeometry = new THREE.BoxGeometry(0.06, 0.06, 0.02);
-  const leds = Array.from({ length: 6 }, (_, i) => {
-    const led = new THREE.Mesh(ledGeometry, ledMaterial);
-    led.position.set(-0.35 + i * 0.14, 0.9, TERMINAL.d / 2 + 0.01);
-    return led;
-  });
-  const light = new THREE.PointLight(NODE_COLOR, 50, 36, 2);
-  light.position.set(0, 2.8, 1.4);
-  terminal.add(rack, screen, light, ...leds);
-
-  scene.add(building, beam, beacon, glow, terminal);
-
-  let level = 1;
-  return {
-    update(n: { lit: boolean; progress: number }, dt: number, time: number) {
-      level += ((n.lit ? 1 : 0) - level) * Math.min(1, dt * 2.5);
-      if (!n.lit && level < 0.02) level = 0;
-      // The power stutters while the switch is held.
-      const held = n.lit && n.progress > 0;
-      const stutter = held && Math.random() < 0.25 + (n.progress / SHUTDOWN_HOLD) * 0.4 ? 0.25 : 1;
-      const v = level * stutter * (0.92 + 0.08 * Math.sin(time * 23 + site.id));
-      material.emissiveIntensity = 1.3 * v;
-      beamMaterial.opacity = 0.12 * v;
-      light.intensity = 50 * v;
-      glow.intensity = 90 * v;
-      screenMaterial.color.setScalar(v > 0.3 ? 1 : 0.02);
-      ledMaterial.color.setHex(v > 0.3 ? 0x4dff88 : 0x200000);
-      beacon.visible = n.lit && Math.sin(time * 3 + site.id) > 0.6;
-      if (level === 0 && !material.fog) {
-        material.fog = true;
-        material.needsUpdate = true;
-        beam.visible = false;
-      }
-    },
+/** Dust drifting around the camera, visible only where the flashlight catches it. */
+function dust() {
+  const rand = mulberry32(17);
+  const box = 12;
+  const positions = new Float32Array(700 * 3).map(() => rand() * box);
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  const uniforms = {
+    uCam: { value: new THREE.Vector3() },
+    uTime: { value: 0 },
+    uLight: { value: 1 },
+    uScale: { value: 600 },
   };
-}
-
-function makeHunter(scene: THREE.Scene, tex: Textures) {
-  const rand = mulberry32(5);
-  const group = new THREE.Group();
-  const shell = new THREE.MeshStandardMaterial({ color: 0x08080c, metalness: 0.9, roughness: 0.25 });
-  const body = new THREE.Mesh(new THREE.BoxGeometry(0.5, 2.6, 0.32), shell);
-  body.position.y = 2.2;
-  const head = new THREE.Mesh(new THREE.BoxGeometry(0.64, 0.46, 0.5), shell);
-  head.position.y = 3.76;
-  const eyeMaterial = new THREE.MeshBasicMaterial({ color: new THREE.Color(EYE.r, EYE.g, EYE.b) });
-  const eye = new THREE.Mesh(new THREE.BoxGeometry(0.36, 0.07, 0.02), eyeMaterial);
-  eye.position.set(0, 3.76, 0.26);
-  // The glow ignores fog, so the eye shows as a red point from far away.
-  const glowMaterial = new THREE.SpriteMaterial({
-    map: tex.glow,
-    color: 0xff2a2a,
-    transparent: true,
-    blending: THREE.AdditiveBlending,
-    depthWrite: false,
-    fog: false,
-  });
-  const glow = new THREE.Sprite(glowMaterial);
-  glow.position.set(0, 3.76, 0.3);
-  glow.scale.set(1.1, 0.9, 1);
-  const light = new THREE.PointLight(0xff2a2a, 12, 16, 2);
-  light.position.set(0, 3.7, 0.5);
-  group.add(body, head, eye, glow, light);
-  // Loose cables hang from the base and never quite reach the ground.
-  for (let i = 0; i < 6; i++) {
-    const length = 0.5 + rand() * 0.7;
-    const cable = new THREE.Mesh(new THREE.CylinderGeometry(0.015, 0.03, length, 4), shell);
-    cable.position.set((rand() - 0.5) * 0.4, 0.9 - length / 2, (rand() - 0.5) * 0.22);
-    cable.rotation.z = (rand() - 0.5) * 0.25;
-    group.add(cable);
-  }
-  scene.add(group);
-
-  let yaw = 0;
-  let level = 1;
-  const last = { x: NaN, z: NaN };
-  return {
-    update(game: Game, dt: number, time: number) {
-      const h = game.hunter;
-      const p = game.player;
-      if (game.status === "won") level = Math.max(0, level - dt * 0.7);
-      const dx = h.x - last.x;
-      const dz = h.z - last.z;
-      if (game.status === "caught") {
-        yaw += shortestTurn(yaw, Math.atan2(p.x - h.x, p.z - h.z)) * Math.min(1, dt * 10);
-      } else if (!Number.isNaN(last.x) && Math.hypot(dx, dz) > 1e-3) {
-        yaw += shortestTurn(yaw, Math.atan2(dx, dz)) * Math.min(1, dt * 8);
-      }
-      last.x = h.x;
-      last.z = h.z;
-
-      // It never holds quite still up close.
-      const near = Math.hypot(p.x - h.x, p.z - h.z);
-      const glitch = near < 18 && Math.random() < 0.12 ? 0.18 : 0;
-      const jitter = () => (Math.random() - 0.5) * glitch;
-      group.position.set(h.x + jitter(), Math.sin(time * 2) * 0.08 + jitter(), h.z + jitter());
-      group.rotation.y = yaw;
-
-      const hunting = h.state === "hunt";
-      const pulse = hunting ? 1 + 0.35 * Math.sin(time * 14) : 1;
-      const k = (hunting ? 1.6 : 1) * pulse * level;
-      light.intensity = (hunting ? 34 : 12) * pulse * level;
-      eyeMaterial.color.setRGB(EYE.r * k, EYE.g * k, EYE.b * k);
-      glowMaterial.opacity = Math.min(1, 0.6 * k);
-    },
-  };
+  const points = new THREE.Points(
+    geometry,
+    new THREE.ShaderMaterial({
+      uniforms,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      vertexShader: `
+        uniform vec3 uCam;
+        uniform float uTime;
+        uniform float uScale;
+        varying float vLight;
+        void main() {
+          vec3 drift = vec3(sin(uTime * 0.21 + position.y), sin(uTime * 0.37 + position.x) * 0.4 - uTime * 0.12, cos(uTime * 0.17 + position.z)) * 0.6;
+          vec3 p = mod(position + drift - uCam, ${box}.0) - ${box / 2}.0 + uCam;
+          vec4 view = viewMatrix * vec4(p, 1.0);
+          float dist = -view.z;
+          float cone = smoothstep(0.88, 0.975, dot(normalize(view.xyz), normalize(vec3(0.0, -0.05, -1.0))));
+          vLight = cone * smoothstep(0.5, 1.2, dist) * (1.0 - smoothstep(3.0, 6.0, dist));
+          gl_Position = projectionMatrix * view;
+          gl_PointSize = max(1.0, uScale * 0.008 / dist);
+        }`,
+      fragmentShader: `
+        uniform float uLight;
+        varying float vLight;
+        void main() {
+          float a = smoothstep(0.5, 0.1, length(gl_PointCoord - 0.5)) * vLight * uLight;
+          gl_FragColor = vec4(vec3(1.0, 0.94, 0.82) * a * 0.55, 1.0);
+        }`,
+    }),
+  );
+  points.frustumCulled = false;
+  return { points, uniforms };
 }

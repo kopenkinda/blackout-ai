@@ -5,6 +5,8 @@
 export type Vec2 = { x: number; z: number };
 export type Rect = { x: number; z: number; w: number; d: number };
 export type Building = Rect & { h: number; node: number | null };
+/** A parked car. The rect is the axis-aligned box around it, for collision. */
+export type Car = Rect & { yaw: number; paint: number };
 export type NodeSite = {
   id: number;
   x: number;
@@ -20,13 +22,15 @@ export type City = {
   half: number;
   buildings: Building[];
   nodes: NodeSite[];
+  cars: Car[];
   spawn: Vec2;
-  hunterSpawn: Vec2;
+  hunterSpawns: Vec2[];
 };
 
 export const NODE_COUNT = 6;
 export const TERMINAL = { w: 1.2, d: 0.6, h: 2 };
 export const SIDEWALK = 2.5;
+export const CAR = { length: 4.3, width: 1.85 };
 
 const BLOCKS = 8;
 const BLOCK = 24;
@@ -142,6 +146,34 @@ export function createCity(seed = 1): City {
     return { id, x: b.x + facing.x * off, z: b.z + facing.z * off, facing, building };
   });
 
+  // Abandoned cars along the curbs, clear of the crosswalks. A few were left at an angle.
+  const cars: Car[] = [];
+  const step = BLOCK + STREET;
+  const origin = -half + STREET / 2;
+  for (let k = 0; k <= BLOCKS; k++) {
+    for (let m = 0; m < BLOCKS; m++) {
+      for (const alongX of [false, true]) {
+        for (const side of [-1, 1]) {
+          if (rand() > 0.2) continue;
+          const along = origin + (m + 0.5) * step + (rand() - 0.5) * 12;
+          const across = origin + k * step + side * 3.1;
+          const skew = rand() < 0.2 ? (rand() - 0.5) * 0.8 : (rand() - 0.5) * 0.06;
+          const yaw = (alongX ? Math.PI / 2 : 0) + skew;
+          const sin = Math.abs(Math.sin(yaw));
+          const cos = Math.abs(Math.cos(yaw));
+          cars.push({
+            x: alongX ? along : across,
+            z: alongX ? across : along,
+            w: sin * CAR.length + cos * CAR.width,
+            d: cos * CAR.length + sin * CAR.width,
+            yaw,
+            paint: rand(),
+          });
+        }
+      }
+    }
+  }
+
   const city: City = {
     blocks: BLOCKS,
     blockSize: BLOCK,
@@ -149,11 +181,17 @@ export function createCity(seed = 1): City {
     half,
     buildings,
     nodes,
+    cars,
     spawn: { x: 0, z: 0 },
-    hunterSpawn: { x: 0, z: 0 },
+    hunterSpawns: [],
   };
   city.spawn = intersection(city, mid, mid);
-  city.hunterSpawn = intersection(city, 0, 0);
+  city.hunterSpawns = [
+    intersection(city, 0, 0),
+    intersection(city, BLOCKS, 0),
+    intersection(city, BLOCKS, BLOCKS),
+    intersection(city, 0, BLOCKS),
+  ];
   return city;
 }
 

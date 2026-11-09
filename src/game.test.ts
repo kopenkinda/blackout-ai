@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { Game, HUNTER, PLAYER, type Input } from "./game.ts";
+import { Game, HUNTER, PLAYER, PROFILES, type Input } from "./game.ts";
 
 const idle: Input = { forward: 0, strafe: 0, sprint: false, interact: false };
 const run = (game: Game, seconds: number, input: Input) => {
@@ -16,6 +16,13 @@ const standAtSwitch = (game: Game, node: number) => {
   game.player.x = site.x + site.facing.x * 1.2;
   game.player.z = site.z + site.facing.z * 1.2;
 };
+const parkHunters = (game: Game) => {
+  game.hunters.forEach((h, i) =>
+    Object.assign(h, game.city.hunterSpawns[i], { state: "wander", goal: null, path: [] }),
+  );
+};
+const distance = (a: { x: number; z: number }, b: { x: number; z: number }) =>
+  Math.hypot(a.x - b.x, a.z - b.z);
 
 test("walking into a building stops at its wall", () => {
   const game = started();
@@ -29,7 +36,7 @@ test("walking into a building stops at its wall", () => {
   assert.ok(game.player.x > wall - 1.5, "player did not move toward the wall");
 });
 
-test("holding the switch for three seconds shuts a node down and alerts the hunter", () => {
+test("holding the switch for three seconds shuts a node down and alerts every hunter", () => {
   const game = started();
   standAtSwitch(game, 0);
   run(game, 1.5, { ...idle, interact: true });
@@ -40,8 +47,10 @@ test("holding the switch for three seconds shuts a node down and alerts the hunt
   run(game, 3.1, { ...idle, interact: true });
   assert.equal(game.nodes[0].lit, false);
   assert.equal(game.remaining, 5);
-  assert.equal(game.hunter.state, "search");
-  assert.deepEqual(game.hunter.goal, { x: game.player.x, z: game.player.z });
+  for (const h of game.hunters) {
+    assert.equal(h.state, "search");
+    assert.ok(h.goal && distance(h.goal, game.player) < 1.5, `${h.profile.name} was not sent`);
+  }
   const shutdown = game.events.find((e) => e.type === "shutdown");
   assert.deepEqual(shutdown, { type: "shutdown", node: 0, remaining: 5 });
 });
@@ -49,7 +58,7 @@ test("holding the switch for three seconds shuts a node down and alerts the hunt
 test("shutting down every node wins", () => {
   const game = started();
   for (let i = 0; i < game.nodes.length; i++) {
-    Object.assign(game.hunter, game.city.hunterSpawn, { state: "wander", goal: null });
+    parkHunters(game);
     standAtSwitch(game, i);
     run(game, 3.1, { ...idle, interact: true });
   }
@@ -58,25 +67,36 @@ test("shutting down every node wins", () => {
   assert.ok(game.events.some((e) => e.type === "won"));
 });
 
-test("the hunter sees down an open street but not around a corner", () => {
+test("a hunter sees down an open street but not around a corner", () => {
   const open = started();
-  Object.assign(open.hunter, { x: open.player.x, z: open.player.z - 30 });
+  Object.assign(open.hunters[0], { x: open.player.x, z: open.player.z - 30 });
   open.step(1 / 60, idle);
-  assert.equal(open.hunter.sees, true);
-  assert.equal(open.hunter.state, "hunt");
+  assert.equal(open.hunters[0].sees, true);
+  assert.equal(open.hunters[0].state, "hunt");
 
   const corner = started();
-  Object.assign(corner.hunter, { x: corner.player.x + 30, z: corner.player.z + 12 });
+  Object.assign(corner.hunters[0], { x: corner.player.x + 30, z: corner.player.z + 12 });
   corner.step(1 / 60, idle);
-  assert.equal(corner.hunter.sees, false);
-  assert.equal(corner.hunter.state, "wander");
+  assert.equal(corner.hunters[0].sees, false);
+  assert.equal(corner.hunters[0].state, "wander");
 });
 
 test("a hunter with a clear line catches a standing player", () => {
   const game = started();
-  Object.assign(game.hunter, { x: game.player.x, z: game.player.z - 10 });
-  run(game, (10 - HUNTER.catchDistance) / HUNTER.huntSpeed + 0.5, idle);
+  Object.assign(game.hunters[0], { x: game.player.x, z: game.player.z - 10 });
+  run(game, (10 - HUNTER.catchDistance) / PROFILES[0].hunt + 0.5, idle);
   assert.equal(game.status, "caught");
+  assert.equal(game.caughtBy, 0);
   const types = game.events.map((e) => e.type);
   assert.ok(types.indexOf("spotted") < types.indexOf("caught"));
+});
+
+test("the grid sends a hunter toward a player who hides and waits", () => {
+  const game = started();
+  run(game, 21, idle);
+  assert.equal(game.status, "playing");
+  const sent = game.hunters.filter(
+    (h) => h.state !== "wander" && h.goal && distance(h.goal, game.player) < 50,
+  );
+  assert.ok(sent.length >= 1, "no hunter was sent toward the player");
 });
